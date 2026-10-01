@@ -1,0 +1,110 @@
+# Publishes a GitHub release for Windows and Linux when a v* tag is pushed.
+# build.yml covers the per-commit build and tests; this one packages.
+#
+# The runners have no ROM set, so the playable `daytona` binary is not built
+# here: CMake only adds that target once scripts/recompile.py has turned your
+# own daytona93 set into C++. What a release carries are the tools (m2import,
+# m2recomp, m2sndrecomp, m2tgprecomp, the trace tools). The packaging step
+# picks up `daytona` as well whenever it does exist.
+
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2022
+            target: windows-x64
+          - os: ubuntu-24.04
+            target: linux-x64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # extern/ is five pinned checkouts (SoftFloat, SDL 3, ymfm, the LZMA SDK,
+      # Dear ImGui); the commits only change when scripts/setup.py does.
+      - name: Cache the pinned dependencies
+        uses: actions/cache@v4
+        with:
+          path: extern
+          key: extern-${{ matrix.target }}-${{ hashFiles('scripts/setup.py') }}
+
+      # SDL 3 is built from source with the project; setup.sh installs the X11,
+      # Wayland, audio and KMS headers it needs.
+      - name: Fetch the dependencies and build (Linux)
+        if: runner.os == 'Linux'
+        run: ./setup.sh
+
+      - name: Fetch the dependencies and build (Windows)
+        if: runner.os == 'Windows'
+        run: python scripts/setup.py
+
+      - name: Tests
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Package
+        shell: bash
+        run: |
+          out="daytona-arcade-recomp-${{ matrix.target }}"
+          mkdir -p "$out"
+          # The Visual Studio generator puts binaries in build/Release.
+          for d in build build/Release; do
+            for f in "$d"/*; do
+              [ -f "$f" ] || continue
+              case "$f" in
+                *.exe|*.dll) cp "$f" "$out/" ;;
+                *.lib|*.a|*.o|*.obj|*.pdb|*.cmake|*.txt|*.json|*.ninja*) ;;
+                *) [ -x "$f" ] && cp "$f" "$out/" ;;
+              esac
+            done
+          done
+          cp README.md THIRD_PARTY.md "$out/"
+          ls -l "$out"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: daytona-arcade-recomp-${{ matrix.target }}
+          path: daytona-arcade-recomp-${{ matrix.target }}/
+          if-no-files-found: error
+
+  release:
+    name: release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Archive each target
+        run: |
+          cd dist
+          for d in */; do
+            name="${d%/}"
+            (cd "$name" && zip -qr "../$name.zip" .)
+          done
+          ls -l *.zip
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" dist/*.zip \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "${GITHUB_REF_NAME}" \
+            --notes "Build tools for Windows and Linux. The playable \`daytona\` binary is not in this release: it only exists once you have recompiled your own \`daytona93\` ROM set locally (see README.md)."
